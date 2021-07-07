@@ -248,9 +248,10 @@ class SqlAlchemyQueryTranslator:
         if len(self._conjunctions) > 0:
             clauses = [sa.or_(*self._conjunctions)]
         for (tables, conj) in self._joins:
-            # JPC - TODO here is to chain joins
-            assert len(tables) == 2, "SqlAlchemy currently supports only two tables in join"
-            pred = sa.sql.expression.join(*tables, conj)
+            tables = sorted(tables)  # sort purely for convenience in testing
+            pred = sa.sql.expression.join(self._from_table_obj, sa.Table(tables[0], self._meta, autoload_with=self._engine), onclause=conj, isouter=False)
+            for k in range(len(tables) - 1):
+                pred = pred.join(sa.Table(tables[k + 1], self._meta, autoload_with=self._engine), onclause=conj, isouter=False)
             clauses.append(pred)
         return clauses
 

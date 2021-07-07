@@ -274,7 +274,7 @@ multi_table_assert_cases = [
             data.q[x].a = data.r[y].b
         }''',
         True,
-        [[['r'], '(q.a = r.b)']],
+        ['q JOIN r ON q.a = r.b'],
     ),
     (
         'three-way join',
@@ -285,7 +285,7 @@ multi_table_assert_cases = [
             data.q[x].c = data.s[z].c
         }''',
         True,
-        [[['s', 'r'], '(q.a = r.b AND q.c = s.c)']],
+        ['q JOIN r ON q.a = r.b AND q.c = s.c JOIN s ON q.a = r.b AND q.c = s.c'],
     ),
     (
         'mixed',
@@ -298,7 +298,7 @@ multi_table_assert_cases = [
             data.q[y].a = data.r[z].b
         }''',
         True,
-        ['((q.a = 10))', [['r'], '(q.a = r.b)']],
+        ['q.a = 10', 'q JOIN r ON q.a = r.b'],
     ),
     (
         'self-join',
@@ -332,13 +332,6 @@ def test_compile_one_table_double_eq(note, input, policy, exp_defined, exp_sql):
 
 @pytest.mark.parametrize('note,input,policy,exp_defined,exp_sql', multi_table_assert_cases)
 def test_compile_multi_table(note, input, policy, exp_defined, exp_sql):
-    clauses = []
-    for clause in exp_sql:
-        if isinstance(clause, str):
-            clauses.append('WHERE ' + clause)
-        else:
-            joins = ' '.join('INNER JOIN ' + t for t in clause[0])
-            clauses.append(joins + ' ON ' + clause[1])
     crunch(
         'data.test.p = true',
         input,
@@ -346,20 +339,20 @@ def test_compile_multi_table(note, input, policy, exp_defined, exp_sql):
         'q',
         policy,
         exp_defined,
-        clauses,
+        exp_sql or None,
     )
 
 
 def crunch(query, input, unknowns, from_table, policy, exp_defined, exp_sql):
     import sqlalchemy as sa
     engine = sa.create_engine("sqlite://")
-    engine.execute("CREATE TABLE q (b text, c text, include boolean, exclude boolean, n integer, a integer)")
-    engine.execute("CREATE TABLE r (b text, c text, include boolean, exclude boolean, n integer, a integer)")
-    engine.execute("CREATE TABLE s (b text, c text, include boolean, exclude boolean, n integer, a integer)")
+    engine.execute("CREATE TABLE q (b integer, c text, include boolean, exclude boolean, n integer, a integer)")
+    engine.execute("CREATE TABLE r (b integer, c text, include boolean, exclude boolean, n integer, a integer)")
+    engine.execute("CREATE TABLE s (b integer, c text, include boolean, exclude boolean, n integer, a integer)")
 
     engine.execute("INSERT INTO q (b, c, include, exclude, n, a) VALUES (\"foo\", \"cat\", true, false, 1, -1), (\"bar\", \"dog\", false, true, 2, -2), (\"baz\", \"fish\", true, false, 3, -3)")
-    engine.execute("INSERT INTO r (b, c, include, exclude, n, a) VALUES (\"foo-r\", \"cat-r\", false, true, 2, -2), (\"bar-r\", \"dog-r\", true, false, 3, -3), (\"baz-r\", \"fish-r\", false, true, 4, -4)")
-    engine.execute("INSERT INTO s (b, c, include, exclude, n, a) VALUES (\"foo-s\", \"cat-s\", true, false, 3, -3), (\"bar-s\", \"dog-s\", true, true, 4, -4), (\"baz-s\", \"fish-s\", true, true, 5, -5)")
+    engine.execute("INSERT INTO r (b, c, include, exclude, n, a) VALUES (-1, \"cat-r\", false, true, 2, -2), (\"bar-r\", \"dog-r\", true, false, 3, -3), (\"baz-r\", \"fish-r\", false, true, 4, -4)")
+    engine.execute("INSERT INTO s (b, c, include, exclude, n, a) VALUES (1, \"cat\", true, false, 3, -3), (\"bar-s\", \"dog-s\", true, true, 4, -4), (\"baz-s\", \"fish-s\", true, true, 5, -5)")
     try:
         result = opa.compile_sa(query, input, unknowns, engine, from_table, compile_func=opa.compile_command_line({
             'test.rego': policy,
