@@ -36,7 +36,7 @@ Posts can be listed (e.g., GET /posts) or read individually (e.g., GET /posts/12
 
 With the above policy loaded into OPA, you can invoke compile:
 
->>> from data_filter_example import opa
+>>> from data_filter_sqlalchemy import opa
 >>> result = opa.compile(q='data.example.allow==true', input={'method':'GET', 'path': ['posts'], 'user': 'bob'}, unknowns=['posts'])
 
 The result will contain the SQL clauses to apply to your query.
@@ -71,7 +71,7 @@ import subprocess
 import json
 from collections import namedtuple
 from rego import ast, walk
-from data_filter_example import sql
+from data_filter_sqlalchemy import sql
 
 
 class TranslationError(Exception):
@@ -163,27 +163,6 @@ def compile(q, input, unknowns, from_table=None, compile_func=None):
 
     return Result(True, clauses)
 
-def compile_sa(q, input, unknowns, engine, from_table=None, compile_func=None):
-    """Returns a :class:`Result` that can be interpreted by the app to enforce
-    the policy."""
-
-    if compile_func is None:
-        compile_func = compile_http
-
-    queries = compile_func(query=q, input=input, unknowns=['data.' + u for u in unknowns])
-
-    # Check if query is never or always defined.
-    if len(queries) == 0:
-        return Result(False, None)
-    elif any((len(x) == 0 for x in queries)):
-        return Result(True, None)
-
-    # Compile query set into SQL clauses.
-    query_set = ast.QuerySet.from_data(queries)
-    queryPreprocessor().process(query_set)
-    clauses = SqlAlchemyQueryTranslator(from_table, engine=engine).translate(query_set)
-
-    return Result(True, clauses)
 
 def splice(SELECT, FROM, WHERE='', decision=None, sql_kwargs=None):
     """Returns a SQL query as a string constructed from the caller's provided
@@ -198,138 +177,6 @@ def splice(SELECT, FROM, WHERE='', decision=None, sql_kwargs=None):
             if WHERE:
                 queries[i] = queries[i] + ' AND (' + WHERE + ')'
     return ' UNION '.join(queries)
-
-import sqlalchemy as sa
-
-
-def splice_sqlalchemy(selectable, select_from, where=None, decision=None):
-    if where is not None:
-        conditions = [sa.and_(condition, where) for condition in conditions]
-
-    return sa.sql.expression.union(
-        [
-            sa.select(selectable).from_table(select_from).where(condition)
-            for condition in conditions
-        ]
-    )
-
-class SqlAlchemyQueryTranslator:
-    # Maps supported Rego relational operators to SQL relational operators.
-    _sql_relation_operators = {
-        'eq': sa.sql.expression.ColumnOperators.__eq__,
-        'equal': sa.sql.expression.ColumnOperators.__eq__,
-        'neq': sa.sql.expression.ColumnOperators.__ne__,
-        'lt': sa.sql.expression.ColumnOperators.__lt__,
-        'gt': sa.sql.expression.ColumnOperators.__gt__,
-        'lte': sa.sql.expression.ColumnOperators.__le__,
-        'gte': sa.sql.expression.ColumnOperators.__ge__,
-    }
-
-    _sql_call_operators = {
-        'abs': sa.func.abs,
-    }
-
-    def __init__(self, from_table, engine):
-        self._engine = engine
-        self._meta = sa.MetaData()
-        self._from_table_obj = sa.Table(from_table, self._meta, autoload_with=engine)
-        self._from_table = from_table
-        self._joins = []
-        self._conjunctions = []
-        self._tables = set([])
-        self._relations = []
-        self._operands = []
-
-    def translate(self, query_set):
-        """Returns a :class:`sql.Union` containing :class:`sql.Where` and
-        :class:`sql.InnerJoin` clauses to be applied to the query."""
-        walk.walk(query_set, self)
-        clauses = []
-        if len(self._conjunctions) > 0:
-            clauses = [sa.or_(*self._conjunctions)]
-        for (tables, conj) in self._joins:
-            # JPC - TODO here is to chain joins
-            assert len(tables) == 2, "SqlAlchemy currently supports only two tables in join"
-            pred = sa.sql.expression.join(*tables, conj)
-            clauses.append(pred)
-        return clauses
-
-    def __call__(self, node):
-        if isinstance(node, ast.Query):
-            self._translate_query(node)
-        elif isinstance(node, ast.Expr):
-            self._translate_expr(node)
-        elif isinstance(node, ast.Term):
-            self._translate_term(node)
-        else:
-            return self
-
-    def _translate_query(self, node):
-        """Pushes an expression onto the conjunction or join stack if multiple
-        tables are referred to."""
-        for expr in node.exprs:
-            walk.walk(expr, self)
-        conj = sa.and_(*self._relations)
-        if len(self._tables) > 1:
-            self._tables.remove(self._from_table)
-            self._joins.append((self._tables, conj))
-        else:
-            self._conjunctions.append(conj)
-        self._tables = set([])
-        self._relations = []
-
-    def _translate_expr(self, node):
-        """Pushes an element onto the relation stack."""
-        if not node.is_call():
-            return
-        if len(node.operands) != 2:
-            raise TranslationError('invalid expression: too many arguments')
-        try:
-            op = node.op()
-            sql_op = self._sql_relation_operators[op]
-        except KeyError:
-            raise TranslationError('invalid expression: operator not supported: %s' % op)
-        self._operands.append([])
-        for term in node.operands:
-            walk.walk(term, self)
-        sql_operands = self._operands.pop()
-        # In the event we have only one column expression, ensure it comes first
-        if not isinstance(sql_operands[0], (sa.Column, sa.sql.functions.Function)):
-            sql_operands = reversed(sql_operands)
-        self._relations.append(sql_op(*sql_operands))
-
-    def _translate_term(self, node):
-        """Pushes an element onto the operand stack."""
-        v = node.value
-        if isinstance(v, ast.Scalar):
-            # NOTE - 20210617 - JPC - We're relying on rego's scalar to provide objects with the correct type,
-            # but I would like to investigate whether that is consistent with datetime and numeric types, for example
-            # self._operands[-1].append(sa.text(v.value))
-            self._operands[-1].append(v.value)
-        elif isinstance(v, ast.Ref) and len(v.terms) == 3:
-            table = v.terms[1].value.value
-            self._tables.add(table)
-            table_obj = sa.Table(table, self._meta, autoload_with=self._engine)
-            try:
-                col_name = v.terms[2].value.value
-                col = table_obj.columns[col_name]
-            except KeyError:
-                raise TranslationError(f'invalid column: column not recognized: {col_name}')
-            self._operands[-1].append(col)
-        elif isinstance(v, ast.Call):
-            try:
-                op = v.op()
-                sql_op = self._sql_call_operators[op]
-            except KeyError:
-                raise TranslationError('invalid call: operator not supported: %s' % op)
-            self._operands.append([])
-            for term in v.operands:
-                walk.walk(term, self)
-            sql_operands = self._operands.pop()
-            assert len(sql_operands) == 1, "unexpected number of sql operands"
-            self._operands[-1].append(sql_op(sql_operands[0]))
-        else:
-            raise TranslationError('invalid term: type not supported: %s' % v.__class__.__name__)
 
 
 class queryTranslator(object):
@@ -442,7 +289,7 @@ class queryPreprocessor(object):
     """Implements the visitor pattern to preprocess refs in the Rego query set.
     Preprocessing the Rego query set simplifies the translation process.
 
-    Refs are rewritten to correspond directly to SQL tables aand columns.
+    Refs are rewritten to correspond directly to SQL tables and columns.
     Specifically, refs of the form data.foo[var].bar are rewritten as
     data.foo.bar. Similarly, if var is dereferenced later in the query, e.g.,
     var.baz, that will be rewritten as data.foo.baz."""
