@@ -163,7 +163,7 @@ def compile(q, input, unknowns, from_table=None, compile_func=None):
 
     return Result(True, clauses)
 
-def compile_sa(q, input, unknowns, engine, from_table=None, compile_func=None):
+def compile_sa(q, input, unknowns, engine, meta, from_table=None, compile_func=None):
     """Returns a :class:`Result` that can be interpreted by the app to enforce
     the policy."""
 
@@ -181,7 +181,7 @@ def compile_sa(q, input, unknowns, engine, from_table=None, compile_func=None):
     # Compile query set into SQL clauses.
     query_set = ast.QuerySet.from_data(queries)
     queryPreprocessor().process(query_set)
-    clauses = SqlAlchemyQueryTranslator(from_table, engine=engine).translate(query_set)
+    clauses = SqlAlchemyQueryTranslator(from_table, engine=engine, meta=meta).translate(query_set)
 
     return Result(True, clauses)
 
@@ -202,17 +202,6 @@ def splice(SELECT, FROM, WHERE='', decision=None, sql_kwargs=None):
 import sqlalchemy as sa
 
 
-def splice_sqlalchemy(selectable, select_from, where=None, decision=None):
-    if where is not None:
-        conditions = [sa.and_(condition, where) for condition in conditions]
-
-    return sa.sql.expression.union(
-        [
-            sa.select(selectable).from_table(select_from).where(condition)
-            for condition in conditions
-        ]
-    )
-
 class SqlAlchemyQueryTranslator:
     # Maps supported Rego relational operators to SQL relational operators.
     _sql_relation_operators = {
@@ -229,9 +218,9 @@ class SqlAlchemyQueryTranslator:
         'abs': sa.func.abs,
     }
 
-    def __init__(self, from_table, engine):
+    def __init__(self, from_table, engine, meta):
         self._engine = engine
-        self._meta = sa.MetaData()
+        self._meta = meta
         self._from_table_obj = sa.Table(from_table, self._meta, autoload_with=engine)
         self._from_table = from_table
         self._joins = []

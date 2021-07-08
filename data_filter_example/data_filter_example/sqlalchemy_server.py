@@ -8,18 +8,40 @@ import flask
 from flask_bootstrap import Bootstrap
 
 from data_filter_example import opa
+import sqlalchemy as sa
 
 app = flask.Flask(__name__, static_url_path='/static')
 Bootstrap(app)
 
 def get_post(post_id):
-    decision = query_opa("GET", ["posts", post_id])
+    eng = get_db()
+    meta = flask.g._meta
+    posts = sa.Table("posts", meta, autoload_with=eng)
+    select = sa.select([col for col in posts.columns])
+
+    decision = query_opa("GET", ["posts", post_id], engine=eng, meta=meta, user="alice")
     if not decision.defined:
         raise flask.abort(403)
 
-    sql = opa.splice(SELECT='posts.*', FROM='posts', WHERE='posts.id=?', decision=decision)
+    filtered_queries = []
+    for clause in decision.sql:
+        if isinstance(clause, sa.expression.Join):
+            query = sa.select([col for col in posts.columns]).select_from(clause).where(posts.c.id == post_id)
+        else:
+            query = sa.select([col for col in posts.columns]).select_from(posts).where(
+                sa.and_(
+                    clause,
+                    posts.c.id == post_id
+                )
+            )
+        filtered_query.append(query)
 
-    result = query_db(sql, args=(post_id,), one=True)
+    query = sa.sql.expression.union(
+        filtered_queries
+    )
+
+    result = eng.execute(query).fetchone()
+
     if result is None:
         raise flask.abort(404)
 
@@ -27,17 +49,36 @@ def get_post(post_id):
 
 
 def list_posts():
-    decision = query_opa("GET", ["posts"])
+    eng = get_db()
+    meta = flask.g._meta
+    posts = sa.Table("posts", meta, autoload_with=eng)
+    select = sa.select([col for col in posts.columns])
+
+    decision = query_opa("GET", ["posts"], engine=eng, meta=meta, user="charlie")
     if not decision.defined:
         raise flask.abort(403)
 
-    sql = opa.splice(SELECT='posts.*', FROM='posts', decision=decision)
+    filtered_queries = []
+    for clause in decision.sql:
+        if isinstance(clause, sa.sql.expression.Join):
+            query = sa.select([col for col in posts.columns], w).where(clause)
+        else:
+            query = sa.select([col for col in posts.columns]).select_from(posts).where(clause)
+        filtered_queries.append(query)
 
-    return query_db(sql)
+    query = sa.sql.expression.union(
+        *filtered_queries
+    )
+
+    result = eng.execute(query).fetchall()
+    return [dict(row) for row in result] if result is not None else None
 
 
 def create_post(post):
-    decision = query_opa("POST", ["posts"], post=post)
+    eng = get_db()
+    meta = flask.g._meta
+
+    decision = query_opa("POST", ["posts"], post=post, engine=eng, meta=meta)
     if not decision.defined:
         raise flask.abort(403)
 
@@ -45,13 +86,13 @@ def create_post(post):
         # POST API does not support conditional results.
         raise flask.abort(500)
 
-    db = get_db()
+    db = get_db().raw_connection()
     c = db.cursor()
     insert_post(c, post)
     db.commit()
 
 
-def query_opa(method, path, **kwargs):
+def query_opa(method, path, engine, meta, **kwargs):
     input = {
         'method': method,
         'path': path,
@@ -59,10 +100,14 @@ def query_opa(method, path, **kwargs):
     }
     for key in kwargs:
         input[key] = kwargs[key]
-    return opa.compile_sa(q='data.example.allow==true',
-                       input=input,
-                       unknowns=['posts'],
-                       engine=engine)
+    return opa.compile_sa(
+        q='data.example.allow==true',
+        input=input,
+        unknowns=['posts'],
+        engine=engine,
+        meta=meta,
+        from_table="posts",
+    )
 
 
 @app.route('/api/posts/<post_id>', methods=["GET"])
@@ -128,7 +173,8 @@ def make_subject():
 def get_db():
     db = getattr(flask.g, '_database', None)
     if db is None:
-        db = flask.g._database = sqlite3.connect('posts.db')
+        db = flask.g._database = sa.create_engine('sqlite:///./posts.db')
+        flask.g._meta = sa.MetaData(bind=db)
     db.row_factory = make_dicts
     return db
 
@@ -137,11 +183,11 @@ def get_db():
 def close_connection(e):
     db = getattr(flask.g, '_database', None)
     if db is not None:
-        db.close()
+        db.raw_connection().close()
 
 
 def init_schema():
-    db = get_db()
+    db = get_db().raw_connection()
     c = db.cursor()
     for table in TABLES:
         c.execute('DROP TABLE IF EXISTS ' + table['name'])
@@ -150,7 +196,7 @@ def init_schema():
 
 
 def pump_db():
-    db = get_db()
+    db = get_db().raw_connection()
     c = db.cursor()
     for table in TABLES:
         for row in table['data']:
@@ -162,13 +208,6 @@ def init_db():
     with app.app_context():
         init_schema()
         pump_db()
-
-
-def query_db(query, args=(), one=False):
-    cur = get_db().execute(query, args)
-    rv = cur.fetchall()
-    cur.close()
-    return (rv[0] if rv else None) if one else rv
 
 
 def insert_post(cursor, post):
